@@ -86,6 +86,36 @@ def read_temp():
     return None
 
 
+def get_disks():
+    """按物理磁盘去重，返回最多两块盘的容量信息。
+
+    同一物理盘可能有多个挂载点（如 / 和 /home 同属 nvme0n1），
+    以设备名前缀归组，每组取容量最大的分区作代表，避免重复计数。
+    """
+    groups = {}
+    pattern = re.compile(r"nvme\d+n\d+|mmcblk\d+|sd[a-z]+|vd[a-z]+|hd[a-z]+")
+    for p in psutil.disk_partitions(all=False):
+        if p.fstype in ("squashfs", "tmpfs", "devtmpfs", "efivarfs") or "loop" in p.device:
+            continue
+        m = pattern.search(p.device)
+        if not m:
+            continue
+        phys = m.group(0)
+        try:
+            u = psutil.disk_usage(p.mountpoint)
+        except Exception:
+            continue
+        if phys not in groups or u.total > groups[phys]["total"]:
+            groups[phys] = {
+                "name": phys,
+                "mount": p.mountpoint,
+                "total": u.total,
+                "used": u.used,
+                "pct": u.percent,
+            }
+    return sorted(groups.values(), key=lambda d: -d["total"])[:2]
+
+
 _prev_net = None
 _prev_time = None
 
@@ -94,7 +124,11 @@ def collect():
     global _prev_net, _prev_time
     cpu = psutil.cpu_percent(interval=0.3)
     mem = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
+    disks = get_disks()
+    # 综合百分比 = 两盘已用之和 / 两盘容量之和
+    total = sum(d["total"] for d in disks)
+    used = sum(d["used"] for d in disks)
+    disk_pct = (used / total * 100) if total else 0.0
     net = psutil.net_io_counters()
     now = time.time()
 
@@ -111,9 +145,8 @@ def collect():
         "mem_pct": mem.percent,
         "mem_used": mem.used / (1024**3),
         "mem_total": mem.total / (1024**3),
-        "disk_pct": disk.percent,
-        "disk_used": disk.used / (1024**3),
-        "disk_total": disk.total / (1024**3),
+        "disk_pct": disk_pct,
+        "disks": disks,
         "net_up": up,
         "net_down": down,
         "temp": read_temp(),
@@ -171,15 +204,14 @@ def render(d):
          f"TEMP {d['temp']:.0f}C" if d["temp"] is not None else "N/A"),
         (0, 1, "MEMORY", C_MEM, d["mem_pct"],
          f"{d['mem_used']:.1f}/{d['mem_total']:.0f} GB"),
-        (1, 0, "DISK", C_DISK, d["disk_pct"],
-         f"{d['disk_used']:.0f}/{d['disk_total']:.0f} GB"),
     ]
 
-    # 先画三张渐变卡片底色
+    # 先画四张渐变卡片底色
     for row, col, label, colors, pct, sub in cards:
         x, y = xs[col], ys[row]
         gradient_card(img, (x, y, x + cw, y + ch), colors[0], colors[1])
-
+    x, y = xs[0], ys[1]
+    gradient_card(img, (x, y, x + cw, y + ch), C_DISK[0], C_DISK[1])
     x, y = xs[1], ys[1]
     gradient_card(img, (x, y, x + cw, y + ch), C_NET[0], C_NET[1])
 
@@ -200,6 +232,27 @@ def render(d):
         dr.text((x + cw - 26 - sw, y + 22), sub, font=F_SUB, fill=WHITE)
         progress_bar(dr, (x + 250, y + 78, x + cw - 26, y + 98), pct,
                      blend(colors[0], colors[1], 0.5))
+
+    # DISK 卡：左侧综合百分比，右侧两条磁盘进度条
+    x, y = xs[0], ys[1]
+    dr.text((x + 26, y + 14), "DISK", font=F_LABEL, fill=WHITE)
+    value_frame(dr, (x + 24, y + 50, x + 234, y + 148))
+    num = f"{d['disk_pct']:.0f}"
+    num_font = F_VALUE if len(num) <= 2 else font(76)
+    nw = dr.textbbox((0, 0), num, font=num_font)[2]
+    dr.text((x + 42, y + 52), num, font=num_font, fill=WHITE)
+    dr.text((x + 52 + nw, y + 92), "%", font=F_UNIT, fill=WHITE)
+
+    disks = d["disks"][:2]
+    f_disk = F_SUB if len(disks) == 2 else F_LABEL
+    for i, dk in enumerate(disks):
+        by = y + 44 + i * 54
+        # 标签：挂载点 + 已用/总容量
+        label_txt = f"{dk['mount']}  {dk['used']/1024**3:.0f}/{dk['total']/1024**3:.0f}G"
+        dr.text((x + 250, by), label_txt, font=f_disk, fill=WHITE)
+        # 进度条（下方）
+        progress_bar(dr, (x + 250, by + 28, x + cw - 26, by + 46), dk["pct"],
+                     blend(C_DISK[0], C_DISK[1], 0.5))
 
     # NETWORK 卡：上下行并排大字
     x, y = xs[1], ys[1]
